@@ -59,4 +59,6 @@ Poprzednia lokalizacja: https://19felix90.github.io/Kompas-WRO/my-bar/ . Nowa: h
 
 Dane barku są zapisywane lokalnie w przeglądarce. Na tym samym hostingu `19felix90.github.io` i w tej samej przeglądarce dane mogą być nadal dostępne dzięki temu samemu kluczowi `mybar_v1_2026`. Natomiast aplikacje zainstalowane osobno z ekranu iPhone'a mogą używać odizolowanej pamięci. Przed usunięciem starego skrótu wyeksportuj kopię JSON w dotychczasowej aplikacji i zaimportuj ją w nowej.
 
-Publikowanie: statyczne GitHub Pages z gałęzi `main`, katalog `/(root)`. W przypadku niezainicjowanego GitHub Pages w ustawieniach repozytorium: **Settings → Pages → Build and deployment → Deploy from a branch → main / (root) → Save**.
+Publikowanie: **GitHub Actions**. Repozytorium ma już gotowy workflow `.github/workflows/pages.yml`, który publikuje statyczną aplikację przy każdej zmianie w `main`. Wymagane jednorazowe ustawienie GitHub Pages: **Settings → Pages → Build and deployment → Source: GitHub Actions**. Nie wybieraj „Deploy from a branch”, ponieważ publikacją zarządza workflow. Ustawienie możesz otworzyć bezpośrednio: https://github.com/19felix90/Bar/settings/pages .
+
+Do czasu uruchomienia nowego GitHub Pages stara aplikacja pod `https://19felix90.github.io/Kompas-WRO/my-bar/` pozostaje dostępna do eksportu danych. Nie usuwaj starego skrótu z iPhone’a przed przeniesieniem pliku JSON, jeśli masz w nim swoje zapasy.
