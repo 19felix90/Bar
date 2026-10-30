@@ -1,0 +1,279 @@
+/* My Bar 1.2 — zaawansowana wyszukiwarka produktów.
+ * Podpowiedzi lokalne działają od razu i offline. Online: opcjonalna wyszukiwarka
+ * Open Food Facts Search-a-licious, bez klucza. Zapytania są ograniczane i cache'owane.
+ * Zewnętrzne metadane są traktowane jako sugestia, nie pewnik. */
+'use strict';
+const PRODUCT_SEARCH={
+  query:'',items:[],status:'idle',cache:new Map(),lastAt:0,timer:null,abort:null,requestId:0,selected:null
+};
+function productText(x,limit=160){return String(x??'').replace(/[\u0000-\u001F\u007F]/g,' ').trim().slice(0,limit);}
+function editDistanceLimited(a,b,max=2){
+  if(Math.abs(a.length-b.length)>max)return max+1;
+  let prev=Array.from({length:b.length+1},(_,i)=>i);
+  for(let i=1;i<=a.length;i++){
+    const row=[i];
+    for(let j=1;j<=b.length;j++)row.push(Math.min(row[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1)));
+    if(Math.min(...row)>max)return max+1;
+    prev=row;
+  }
+  return prev[b.length];
+}
+// Pozwala wkleić pełną nazwę ze sklepu (np. "Rum Companero ... 54% / 0,7l"),
+// zachowując dopasowanie po nazwie wariantu i ignorując końcowe dane opakowania.
+function normalizedProductQueries(query){
+ const q=normalize(query);
+ const corrected=q.replace(/\bsanta theresa\b/g,'santa teresa').replace(/\bcompaniero\b/g,'companero');
+ const variants=new Set([q,corrected].filter(Boolean));
+ for(const part of [...variants]){
+  const unprefixed=part.replace(/^(?:(?:rum|ron|rhum|likier|liqueur)\s+)+/,'');
+  if(unprefixed&&unprefixed!==part)variants.add(unprefixed);
+  const noPack=part.replace(/\s+\d{2}\s+\d+\s+\d+l$/,'').replace(/\s+\d{2}\s+\d+ml$/,'').replace(/\s+\d{2}$/,'').trim();
+  if(noPack&&noPack!==part)variants.add(noPack);
+ }
+ return [...variants];
+}
+function productLocalScore(query,name){
+ const n=normalize(name);if(!n)return Infinity;
+ const words=n.split(' ').filter(Boolean);
+ let best=Infinity;
+ for(const q of normalizedProductQueries(query)){
+  if(q.length<2)continue;
+  if(n===q)best=Math.min(best,0);
+  else if(n.startsWith(q+' '))best=Math.min(best,5);
+  else if(n.startsWith(q))best=Math.min(best,8);
+  else if(q.startsWith(n+' '))best=Math.min(best,11);
+  else if(n.includes(' '+q+' '))best=Math.min(best,16);
+  else if(n.includes(' '+q))best=Math.min(best,19);
+  else if(n.includes(q))best=Math.min(best,25);
+  else if(q.length>=4){
+   const first=words.slice(0,2).join(' ');
+   if(editDistanceLimited(q,first,2)<=2)best=Math.min(best,34+editDistanceLimited(q,first,2));
+   for(const term of words)if(term.length>=4&&editDistanceLimited(q,term,2)<=2)best=Math.min(best,41+editDistanceLimited(q,term,2));
+  }
+  // Szukanie niezależnie od kolejności słów, także przy pojedynczej literówce.
+  const tokens=[...new Set(q.split(' ').filter(t=>t.length>=3&&!/^\d+$/.test(t)))];
+  if(tokens.length>=2){
+   let count=0;
+   for(const token of tokens)if(words.some(w=>w===token||
+     w.length>=4&&token.length>=4&&
+     (w.startsWith(token)||token.startsWith(w)||Math.abs(w.length-token.length)<=1&&editDistanceLimited(w,token,1)<=1)))count++;
+   if(count>=Math.max(2,Math.ceil(tokens.length*.75)))best=Math.min(best,28+(tokens.length-count)*6+Math.max(0,words.length-tokens.length));
+  }
+ }
+ return best;
+}
+function localProductCandidates(query){
+ const q=normalize(query);if(q.length<2)return [];
+ const rows=[],used=new Set();
+ const priority={'botucal reserva exclusiva':-17,'botucal planas':-16,'botucal mantuano':-15,'diplomatico reserva exclusiva':-9,'diplomatico planas':-8,'amarula original cream':-25,'amarula ethiopian coffee cream':-9,'amarula vanilla spice cream':-7,'amarula african gin':-5,'ron companero extra anejo panama 54':-25,'ron companero gran reserva jamaica trinidad':-10,'ron companero elixir orange':-5};
+ const push=(name,key,source,rank)=>{
+   const token=normalize(name);
+   if(!key||!token||used.has(token+'|'+key))return;
+   used.add(token+'|'+key);
+   rows.push({name,key,source,rank:rank+(priority[token]||0)});
+ };
+ for(const item of PRODUCT_BRANDS){
+   const score=Math.min(...[item.name,...(item.aliases||[])].map(term=>productLocalScore(q,term)));
+   if(Number.isFinite(score))push(item.name,item.key,'Katalog My Bar',score);
+ }
+ for(const item of state.stock){
+   const score=productLocalScore(q,item.name);
+   if(Number.isFinite(score))push(item.name,item.key,'Twój barek',score-3);
+ }
+ for(const item of INGREDIENTS){
+   const names=[item.name,item.en,...(item.aliases||[])];
+   const scored=names.map(name=>productLocalScore(q,name));
+   const best=Math.min(...scored);
+   if(Number.isFinite(best))push(item.name,item.id,'Rodzaj składnika',best+22);
+ }
+ return rows.sort((a,b)=>a.rank-b.rank||a.name.length-b.name.length||a.name.localeCompare(b.name,'pl')).slice(0,12);
+}
+function classifyExternalProduct(name,categories=''){
+ const n=normalize(name),c=normalize(categories),combined=n+' '+c;
+ const local=identifyProduct(name);
+ if(local.key&&!local.key.startsWith('custom:')&&['brand','remembered'].includes(local.status))return {key:local.key,confidence:'catalog'};
+ const check=re=>re.test(combined);
+ if(check(/\b(ready to drink|premix|pre mix|mixed cocktails|gotow.+ drink)\b/))return {key:'ready_cocktail',confidence:'type'};
+ if(check(/\b(rum liqueur|rum based liqueur|likier rumowy|likier na bazie rumu)\b/)||
+  check(/\b(rum|rhum|ron)\b/)&&check(/\b(liqueur|liqueurs|liqueure|likier|licor)\b/))
+  return {key:'rum_liqueur',confidence:'type'};
+ if(check(/\b(vegan cream liqueur|plant based cream liqueur|weganski likier kremowy)\b/))return {key:'plant_cream_liqueur',confidence:'type'};
+ // Rum rzeczywiście infuzowany owocami, a nie rum opisany nutą ananasa w smaku.
+ // Sprawdzamy nazwę trunku; kategoria likieru rumowego ma pierwszeństwo.
+ if(/\b(rum|rums|ron|rhum)\b/.test(n)&&
+   /\b(pineapple|ananas|ananasowy|infused|infuzowany|fruit infused)\b/.test(n)&&
+   !/\b(liqueur|likier|licor|syrup|syrop|juice|sok|cocktail)\b/.test(n))
+   return {key:'infused_rum',confidence:'type'};
+ if(check(/\b(vermouth|wermut|vermut)\b/)){
+   if(check(/\b(rosso|rouge|sweet|red|czerwony|slodki)\b/))return {key:'sweet_vermouth',confidence:'type'};
+   if(check(/\b(bianco|blanc|white|bialy)\b/))return {key:'white_vermouth',confidence:'type'};
+   if(check(/\b(dry|extra dry|wytrawny)\b/))return {key:'dry_vermouth',confidence:'type'};
+   return {key:'',confidence:'ambiguous'};
+ }
+ if(check(/\b(rum|rums|ron|rhum)\b/)){
+   if(check(/\b(spiced|spice|korzenny)\b/))return {key:'spiced_rum',confidence:'type'};
+   if(check(/\b(white|blanco|blanc|silver|light|bialy|plata)\b/))return {key:'white_rum',confidence:'type'};
+   if(check(/\b(aged|dark|matured|old|reserve|reserva|anejo|anejo|gold|ciemny|starzony|brun)\b/))return {key:'dark_rum',confidence:'type'};
+   return {key:'rum',confidence:'generic'};
+ }
+ if(check(/\b(tequila)\b/)){
+   if(check(/\b(reposado)\b/))return {key:'tequila_reposado',confidence:'type'};
+   if(check(/\b(anejo|extra anejo)\b/))return {key:'tequila_anejo',confidence:'type'};
+   if(check(/\b(gold|oro)\b/))return {key:'tequila_gold',confidence:'type'};
+   return {key:'tequila',confidence:'generic'};
+ }
+ if(check(/\b(whisky|whiskey|whiskies|whiskys)\b/)){
+   if(check(/\b(liqueur|likier)\b/))return {key:'whiskey_liqueur',confidence:'type'};
+   if(check(/\b(rye|zytnia)\b/))return {key:'rye_whiskey',confidence:'type'};
+   if(check(/\b(bourbon)\b/))return {key:'bourbon',confidence:'type'};
+   if(check(/\b(irish|irlandzka)\b/))return {key:'irish_whiskey',confidence:'type'};
+   return {key:'whiskey',confidence:'generic'};
+ }
+ if(check(/\b(gin|gins)\b/))return {key:check(/\b(pink|flavo(?:u)?red)\b/)?'flavored_gin':'gin',confidence:'type'};
+ if(check(/\b(vodka|wodka)\b/))return {key:check(/\b(flavou?red|citron|vanilla|lemon|raspberry|smakowa)\b/)?'flavored_vodka':'vodka',confidence:'type'};
+ if(check(/\b(mezcal|mescal)\b/))return {key:'mezcal',confidence:'type'};
+ if(check(/\b(pisco)\b/))return {key:'pisco',confidence:'type'};
+ if(check(/\b(cachaca)\b/))return {key:'cachaca',confidence:'type'};
+ if(check(/\b(beer|beers|piwo)\b/))return {key:'beer',confidence:'generic'};
+ if(check(/\b(passoa|passion fruit liqueur|passionfruit liqueur|likier marakujowy|likier z marakui)\b/))return {key:'passion_fruit_liqueur',confidence:'type'};
+ if(check(/\b(passion fruit|passionfruit|marakuja)\b/)&&check(/\b(liqueur|liqueurs|liquor|liquors|likier|likierow|liqueur de fruit)\b/)&&!check(/\b(syrup|syrop|puree|pure)\b/))return {key:'passion_fruit_liqueur',confidence:'type'};
+ if(check(/\b(cream liqueur|irish cream|likier smietankowy)\b/))return {key:'cream_liqueur',confidence:'type'};
+ if(check(/\b(coconut liqueur|likier kokosowy)\b/))return {key:'coconut_liqueur',confidence:'type'};
+ if(check(/\b(coffee liqueur|likier kawowy)\b/))return {key:'coffee_liqueur',confidence:'type'};
+ if(check(/\b(orange liqueur|triple sec|curacao)\b/))return {key:'triple_sec',confidence:'type'};
+ if(check(/\b(limoncello)\b/))return {key:'limoncello',confidence:'type'};
+ if(check(/\b(amaretto)\b/))return {key:'amaretto',confidence:'type'};
+ if(check(/\b(prosecco|champagne|cava|sparkling wine|wino musujace)\b/))return {key:'prosecco',confidence:'generic'};
+ if(check(/\b(tonic|tonik)\b/))return {key:'tonic',confidence:'generic'};
+ if(check(/\b(ginger ale)\b/))return {key:'ginger_ale',confidence:'type'};
+ if(check(/\b(ginger beer)\b/))return {key:'ginger_beer',confidence:'type'};
+ if(check(/\b(cola)\b/))return {key:'cola',confidence:'type'};
+ if(local.key&&!local.key.startsWith('custom:'))return {key:local.key,confidence:'generic'};
+ return {key:'',confidence:'unknown'};
+}
+function decodeOnlineProducts(body,query){
+ const hits=Array.isArray(body?.hits)?body.hits:Array.isArray(body?.products)?body.products:[];
+ const rows=[],seen=new Set(),q=normalize(query);
+ for(const h of hits.slice(0,35)){
+   const p=h?._source||h?.source||h?.product||h?.fields||h;
+   if(!p||typeof p!=='object')continue;
+   const one=x=>Array.isArray(x)?x[0]:x;
+   const brand=productText(one(p.brands)||'',90).split(',')[0].trim();
+   const base=productText(one(p.product_name_pl)||one(p.product_name_en)||one(p.product_name)||one(p.generic_name)||'',120);
+   let name=base||brand;
+   if(brand&&name&&!normalize(name).includes(normalize(brand))&&normalize(brand)!==normalize(name))name=brand+' '+name;
+   if(!name||name.length<3)continue;
+   // Nie wyświetlamy przypadkowych, niepasujących do zapytania produktów.
+   const score=productLocalScore(query,name);
+   if(!Number.isFinite(score)&&!normalize(brand).includes(q))continue;
+   const categories=[p.categories,one(p.categories_tags),one(p.categories_tags_en),p.categories_en].filter(Boolean).join(' ');
+   const matched=classifyExternalProduct(name,categories);
+   const cat=normalize(categories);
+   if(!matched.key&&normalize(name)!==q&&!/\b(alcohol|alcoholic|beverage|beverages|spirits|wine|beer|rums|liquor|liqueur|cocktail|drink|vermouth|juice|syrup|soda|tonic|whisky|whiskey|gin|vodka)\b/.test(cat))continue;
+   const token=normalize(name);
+   if(seen.has(token))continue;seen.add(token);
+   const id=productText(one(p.code)||h?.id||token,60);
+   rows.push({id,name,key:matched.key,confidence:matched.confidence,source:'Open Food Facts',rank:Number.isFinite(score)?score:50,barcode:/^\d{8,14}$/.test(id)?id:null});
+ }
+ return rows.sort((a,b)=>(a.key?0:1)-(b.key?0:1)||a.rank-b.rank||a.name.localeCompare(b.name,'pl')).slice(0,10);
+}
+// Publiczny fallback: Wikidata Action API obsługuje anonimowy dostęp CORS (origin=*).
+// Wynik musi mieć kategorię rozpoznawalną z opisu; nie zgadujemy.
+async function searchWikidataBeverages(query,signal){
+ const u=new URL('https://www.wikidata.org/w/api.php');
+ for(const [k,v] of Object.entries({action:'wbsearchentities',search:query,language:'en',limit:'10',format:'json',origin:'*'}))u.searchParams.set(k,v);
+ const resp=await fetch(u.toString(),{mode:'cors',signal,headers:{Accept:'application/json'}});
+ if(!resp.ok)throw Error('Wikidata HTTP '+resp.status);
+ const data=await resp.json(),list=[],known=new Set();
+ for(const x of Array.isArray(data.search)?data.search:[]){
+  const label=productText(x.label,120),desc=productText(x.description,160);
+  if(!label||!Number.isFinite(productLocalScore(query,label)))continue;
+  const kind=classifyExternalProduct(label,desc);
+  if(!kind.key||!INDEX.has(kind.key)||known.has(normalize(label)))continue;
+  known.add(normalize(label));
+  list.push({id:'wd:'+productText(x.id,32),name:label,key:kind.key,confidence:'description',source:'Wikidata',description:desc,rank:productLocalScore(query,label)});
+ }
+ return list.slice(0,6);
+}
+function currentOnlineCandidates(query){
+ return normalize(query)===normalize(PRODUCT_SEARCH.query)&&PRODUCT_SEARCH.status==='ready'?PRODUCT_SEARCH.items:[];
+}
+function productSuggestionMarkup(query){
+ const n=normalize(query);
+ if(n.length<2)return '<div class="product-suggest-empty">Zacznij wpisywać nazwę alkoholu. Pokażemy konkretne marki i warianty.</div>';
+ const offline=localProductCandidates(query).slice(0,8),online=currentOnlineCandidates(query);
+ const localNames=new Set(offline.map(x=>normalize(x.name)));
+ const extra=online.filter(x=>!localNames.has(normalize(x.name))).slice(0,5);
+ const lines=[];
+ if(offline.length){
+   lines.push('<div class="product-suggest-head">Pasujące produkty</div>');
+   lines.push(...offline.map(x=>'<button type="button" class="product-option" data-action="choose-brand" data-name="'+esc(x.name)+'"><span><b>'+esc(x.name)+'</b><small>'+esc(iName(x.key))+'</small></span><em>'+esc(x.source)+'</em></button>'));
+ }
+ if(extra.length){
+   lines.push('<div class="product-suggest-head">Znalezione w internecie</div>');
+   lines.push(...extra.map(x=>'<button type="button" class="product-option" data-action="choose-online-product" data-id="'+esc(x.id)+'"><span><b>'+esc(x.name)+'</b><small>'+esc(x.key?iName(x.key):'Typ do potwierdzenia')+'</small></span><em>'+esc(x.source)+'</em></button>'));
+ }
+ if(PRODUCT_SEARCH.status==='loading'&&PRODUCT_SEARCH.query===n)lines.push('<div class="product-suggest-info">Przeszukuję katalogi alkoholi…</div>');
+ if(!offline.length&&!extra.length&&PRODUCT_SEARCH.status!=='loading')lines.push('<div class="product-suggest-empty">Nie znalazłeś produktu? Sprawdź katalogi online lub wybierz typ ręcznie.</div>');
+ if(PRODUCT_SEARCH.status==='error'&&PRODUCT_SEARCH.query===n)lines.push('<div class="product-suggest-info warn">Katalogi zewnętrzne chwilowo nie odpowiadają. Możesz wybrać rodzaj ręcznie.</div>');
+ if(n.length>=4&&navigator.onLine){
+   lines.push('<button type="button" class="product-search-more" data-action="search-products-online">Przeszukaj bazy alkoholi '+ico('search','sm')+'</button>');
+ }
+ return lines.join('');
+}
+function renderProductSuggestions(){
+ const input=document.getElementById('add-name'),target=document.getElementById('ingredient-suggestions');
+ if(input&&target)target.innerHTML=productSuggestionMarkup(input.value);
+}
+function resetProductOnline(){
+ clearTimeout(PRODUCT_SEARCH.timer);
+ if(PRODUCT_SEARCH.abort){PRODUCT_SEARCH.abort.abort();PRODUCT_SEARCH.abort=null;}
+ PRODUCT_SEARCH.requestId++;
+ PRODUCT_SEARCH.status='idle';PRODUCT_SEARCH.query='';PRODUCT_SEARCH.items=[];
+}
+function scheduleProductOnlineSearch(query,{force=false}={}){
+ const q=normalize(query);
+ clearTimeout(PRODUCT_SEARCH.timer);
+ if(q.length<4||!navigator.onLine){resetProductOnline();return;}
+ // Szukaj również gdy lokalny katalog zwrócił dużo wyników.
+ if(PRODUCT_SEARCH.cache.has(q)){
+   PRODUCT_SEARCH.query=q;PRODUCT_SEARCH.items=PRODUCT_SEARCH.cache.get(q);PRODUCT_SEARCH.status='ready';
+   renderProductSuggestions();return;
+ }
+ if(!force&&PRODUCT_SEARCH.query===q&&['loading','ready'].includes(PRODUCT_SEARCH.status))return;
+ PRODUCT_SEARCH.query=q;PRODUCT_SEARCH.status='pending';PRODUCT_SEARCH.items=[];
+ // Nie wysyłamy żądania na każde naciśnięcie klawisza.
+ const delay=force?0:1000;
+ PRODUCT_SEARCH.timer=setTimeout(()=>runProductOnlineSearch(q),delay);
+}
+async function runProductOnlineSearch(q){
+ if(!q||q.length<4)return;
+ const now=Date.now();
+ if(now-PRODUCT_SEARCH.lastAt<6500){
+  PRODUCT_SEARCH.status='waiting';renderProductSuggestions();
+  PRODUCT_SEARCH.timer=setTimeout(()=>runProductOnlineSearch(q),6500-(now-PRODUCT_SEARCH.lastAt));
+  return;
+ }
+ if(PRODUCT_SEARCH.abort)PRODUCT_SEARCH.abort.abort();
+ const ctrl=new AbortController();PRODUCT_SEARCH.abort=ctrl;
+ const seq=++PRODUCT_SEARCH.requestId;
+ PRODUCT_SEARCH.lastAt=Date.now();PRODUCT_SEARCH.query=q;PRODUCT_SEARCH.status='loading';renderProductSuggestions();
+ const timeout=setTimeout(()=>ctrl.abort(),11200);
+ try{
+  const result=await lookupAlcoholCatalogs(q,ctrl.signal);
+  if(seq!==PRODUCT_SEARCH.requestId||normalize(document.getElementById('add-name')?.value)!==q)return;
+  if(!result.successes&&!result.items.length)throw Error('Katalogi niedostępne');
+  PRODUCT_SEARCH.items=result.items;PRODUCT_SEARCH.status='ready';
+  PRODUCT_SEARCH.cache.set(q,result.items);
+  if(PRODUCT_SEARCH.cache.size>30)PRODUCT_SEARCH.cache.delete(PRODUCT_SEARCH.cache.keys().next().value);
+ }catch(error){
+  if(seq!==PRODUCT_SEARCH.requestId||normalize(document.getElementById('add-name')?.value)!==q)return;
+  PRODUCT_SEARCH.items=[];PRODUCT_SEARCH.status='error';
+  console.warn('My Bar — katalogi alkoholi:',error);
+ }finally{
+  clearTimeout(timeout);
+  if(PRODUCT_SEARCH.abort===ctrl)PRODUCT_SEARCH.abort=null;
+  if(seq===PRODUCT_SEARCH.requestId)renderProductSuggestions();
+ }
+}
+function selectedOnlineProduct(id){return PRODUCT_SEARCH.items.find(x=>x.id===id)||null;}
